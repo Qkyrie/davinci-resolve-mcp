@@ -190,8 +190,9 @@ class _Harness:
 
 class GrabFramesTest(unittest.TestCase):
     def test_grabs_thumbnails_and_restores_page_and_playhead(self):
-        raw = bytes([200] * (2 * 2 * 3))
-        h = _Harness(thumbs={"tc-0": _thumb(2, 2, raw), "tc-10": _thumb(2, 2, raw)})
+        raw_a = bytes([200] * (2 * 2 * 3))
+        raw_b = bytes([90] * (2 * 2 * 3))
+        h = _Harness(thumbs={"tc-0": _thumb(2, 2, raw_a), "tc-10": _thumb(2, 2, raw_b)})
         out = h.run({"frames": [0, 10]})
         self.assertTrue(out.get("success"), out)
         self.assertEqual(len(out["frames"]), 2)
@@ -235,6 +236,67 @@ class GrabFramesTest(unittest.TestCase):
         out = h.run({"frames": [5]})
         self.assertFalse(out.get("success"))
         self.assertIn("error", out["frames"][0])
+
+    def test_stale_identical_thumbnail_regrabs_via_still_export(self):
+        # Same bytes at two different playheads = Resolve served a stale cached
+        # thumbnail; the second frame must be re-grabbed via still export.
+        raw = bytes([200] * (2 * 2 * 3))
+        still = s._rgb_to_png_bytes(2, 2, bytes([7] * (2 * 2 * 3)))
+        h = _Harness(thumbs={"tc-0": _thumb(2, 2, raw), "tc-10": _thumb(2, 2, raw)},
+                     still_png=still)
+        out = h.run({"frames": [0, 10]})
+        self.assertTrue(out.get("success"), out)
+        first, second = out["frames"]
+        self.assertEqual(first["source"], "thumbnail")
+        self.assertNotIn("stale_thumbnail_detected", first)
+        self.assertEqual(second["source"], "still_export")
+        self.assertTrue(second["stale_thumbnail_detected"])
+        self.assertTrue(os.path.exists(second["path"]))
+        self.assertEqual(out["stale_thumbnail_frames"], [10])
+        self.assertEqual(h.proj.ExportCurrentFrameAsStill.call_count, 1)
+
+    def test_stale_thumbnail_kept_with_warning_when_still_export_fails(self):
+        raw = bytes([200] * (2 * 2 * 3))
+        h = _Harness(thumbs={"tc-0": _thumb(2, 2, raw), "tc-10": _thumb(2, 2, raw)},
+                     still_ok=False)
+        out = h.run({"frames": [0, 10]})
+        self.assertTrue(out.get("success"), out)
+        second = out["frames"][1]
+        self.assertEqual(second["source"], "thumbnail")
+        self.assertTrue(second["stale_thumbnail_detected"])
+        self.assertIn("stale", second["warning"])
+        self.assertTrue(os.path.exists(second["path"]))
+        self.assertEqual(out["stale_thumbnail_frames"], [10])
+
+    def test_source_still_skips_thumbnails_entirely(self):
+        raw = bytes([200] * (2 * 2 * 3))
+        still = s._rgb_to_png_bytes(4, 2, bytes(4 * 2 * 3))
+        h = _Harness(thumbs={"tc-0": _thumb(2, 2, raw)}, still_png=still)
+        out = h.run({"frames": [0, 10], "source": "still"})
+        self.assertTrue(out.get("success"), out)
+        for entry in out["frames"]:
+            self.assertEqual(entry["source"], "still_export")
+        self.assertFalse(h.tl.GetCurrentClipThumbnailImage.called)
+        self.assertEqual(h.proj.ExportCurrentFrameAsStill.call_count, 2)
+
+    def test_source_thumbnail_disables_still_fallback(self):
+        h = _Harness(thumbs={})
+        out = h.run({"frames": [5], "source": "thumbnail"})
+        self.assertFalse(out.get("success"))
+        self.assertFalse(h.proj.ExportCurrentFrameAsStill.called)
+        self.assertIn("error", out["frames"][0])
+
+    def test_source_must_be_a_known_value(self):
+        h = _Harness()
+        out = h.run({"frames": [0], "source": "gallery"})
+        self.assertFalse(out.get("success"))
+        self.assertIn("source must be", str(out["error"]))
+
+    def test_source_still_conflicts_with_fallback_disabled(self):
+        h = _Harness()
+        out = h.run({"frames": [0], "source": "still", "allow_still_fallback": False})
+        self.assertFalse(out.get("success"))
+        self.assertIn("conflicts", str(out["error"]))
 
     def test_diff_pair_writes_diff_png_with_stats(self):
         a = bytes([0] * 12)

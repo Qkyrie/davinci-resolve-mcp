@@ -6186,7 +6186,8 @@ def _timeline_marker_thumbnail_review(proj, tl, p: Dict[str, Any]) -> Dict[str, 
     return review
 
 
-def _grab_frames_still_fallback(proj, path: str, max_width: int, entry: Dict[str, Any]) -> Optional[Tuple[int, int, bytes]]:
+def _grab_frames_still_fallback(proj, path: str, max_width: int, entry: Dict[str, Any],
+                                reason: str = "no Color-page thumbnail") -> Optional[Tuple[int, int, bytes]]:
     """Export the current frame via Project.ExportCurrentFrameAsStill into path.
 
     This is the fallback when the Color-page thumbnail is unavailable — chosen
@@ -6203,7 +6204,7 @@ def _grab_frames_still_fallback(proj, path: str, max_width: int, entry: Dict[str
         return None
     if not exported or not os.path.exists(path):
         entry["error"] = (
-            "Frame grab failed: no Color-page thumbnail and "
+            f"Frame grab failed: {reason} and "
             "ExportCurrentFrameAsStill wrote nothing"
         )
         return None
@@ -6232,6 +6233,11 @@ def _timeline_grab_frames(proj, tl, p: Dict[str, Any]) -> Dict[str, Any]:
     GetCurrentClipThumbnailImage with an ExportCurrentFrameAsStill fallback,
     and writes one PNG per frame. Optionally also writes an amplified
     pixel-diff of a before/after pair.
+
+    GetCurrentClipThumbnailImage can serve a stale cached thumbnail (byte-identical
+    across distinct playhead positions) and never renders Fusion comps. source="auto"
+    (default) detects byte-identical consecutive thumbnails and re-grabs those frames
+    via ExportCurrentFrameAsStill; source="still" skips the thumbnail path entirely.
     """
     frames = p.get("frames")
     if not isinstance(frames, list):
@@ -6242,6 +6248,13 @@ def _timeline_grab_frames(proj, tl, p: Dict[str, Any]) -> Dict[str, Any]:
     max_width = int(_first_param(p, "max_width", "maxWidth", default=640) or 0)
     allow_still_fallback = bool(_first_param(p, "allow_still_fallback", "allowStillFallback", default=True))
     frame_cap = max(1, min(int(_first_param(p, "max_frames", "maxFrames", default=24) or 24), 48))
+    source = str(_first_param(p, "source", default="auto") or "auto").strip().lower()
+    if source not in ("auto", "thumbnail", "still"):
+        return _err("source must be one of: auto (default), thumbnail, still")
+    if source == "still" and not allow_still_fallback:
+        return _err("source='still' conflicts with allow_still_fallback=False")
+    if source == "thumbnail":
+        allow_still_fallback = False
 
     requested: List[int] = []
     for frame in list(frames) + (list(diff_pair) if diff_pair else []):
@@ -6278,6 +6291,7 @@ def _timeline_grab_frames(proj, tl, p: Dict[str, Any]) -> Dict[str, Any]:
 
     entries: List[Dict[str, Any]] = []
     raws: Dict[int, Tuple[int, int, bytes]] = {}
+    last_thumb: Optional[Tuple[int, int, bytes]] = None
     with _color_page_for_thumbnails(get_resolve()) as on_color:
         try:
             for frame_id in requested:
@@ -6295,18 +6309,43 @@ def _timeline_grab_frames(proj, tl, p: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 path = os.path.join(frames_dir, f"{slug}-f{frame_id}-{stamp}.png")
                 thumbnail = None
-                try:
-                    thumbnail = tl.GetCurrentClipThumbnailImage()
-                except Exception:
-                    thumbnail = None
+                if source != "still":
+                    try:
+                        thumbnail = tl.GetCurrentClipThumbnailImage()
+                    except Exception:
+                        thumbnail = None
                 if thumbnail:
                     try:
                         width, height, raw = _thumbnail_raw_rgb(thumbnail)
+                        # GetCurrentClipThumbnailImage can serve a stale cached image:
+                        # byte-identical pixels at a different playhead position. A
+                        # trusted ExportCurrentFrameAsStill re-grab settles it (and is
+                        # also correct for genuinely identical frames, just slower).
+                        stale = last_thumb == (width, height, raw)
+                        last_thumb = (width, height, raw)
+                        if stale and allow_still_fallback:
+                            scratch: Dict[str, Any] = {}
+                            decoded = _grab_frames_still_fallback(proj, path, max_width, scratch)
+                            if decoded is not None or scratch.get("source") == "still_export":
+                                entry.update(scratch)
+                                entry["stale_thumbnail_detected"] = True
+                                if decoded is not None:
+                                    raws[frame_id] = decoded
+                                continue
                         width, height, raw = _scale_rgb_to_max_width(width, height, raw, max_width)
                         with open(path, "wb") as handle:
                             handle.write(_rgb_to_png_bytes(width, height, raw))
                         raws[frame_id] = (width, height, raw)
                         entry.update({"path": path, "width": width, "height": height, "source": "thumbnail"})
+                        if stale:
+                            entry["stale_thumbnail_detected"] = True
+                            entry["warning"] = (
+                                "Thumbnail is byte-identical to the previous frame's grab and the "
+                                "still-export re-grab failed; pixels may be a stale cached thumbnail"
+                                if allow_still_fallback
+                                else "Thumbnail is byte-identical to the previous frame's grab; "
+                                "pixels may be a stale cached thumbnail (still fallback disabled)"
+                            )
                         continue
                     except (ValueError, OSError) as exc:
                         entry["thumbnail_error"] = str(exc)
@@ -6319,7 +6358,10 @@ def _timeline_grab_frames(proj, tl, p: Dict[str, Any]) -> Dict[str, Any]:
                         "still fallback disabled"
                     )
                     continue
-                decoded = _grab_frames_still_fallback(proj, path, max_width, entry)
+                decoded = _grab_frames_still_fallback(
+                    proj, path, max_width, entry,
+                    reason="source='still' requested" if source == "still" else "no Color-page thumbnail",
+                )
                 if decoded is not None:
                     raws[frame_id] = decoded
         finally:
@@ -6336,6 +6378,9 @@ def _timeline_grab_frames(proj, tl, p: Dict[str, Any]) -> Dict[str, Any]:
         "grabbed_count": len(grabbed),
         "project_root": root["project_root"],
     }
+    stale_frames = [entry["frame"] for entry in entries if entry.get("stale_thumbnail_detected")]
+    if stale_frames:
+        result["stale_thumbnail_frames"] = stale_frames
     if not grabbed:
         result["error"] = (
             "No frames could be grabbed"
@@ -21958,11 +22003,16 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         # example: action_help(name='<action_name>')
       thumbnail_contact_sheet(frames?|max_samples?, analysis_root?) -> {path, samples}
         frames are relative to the timeline start (frame 0 = first frame), like marker frameIds.
-      grab_frames(frames, diff_pair?, max_width?, allow_still_fallback?, max_frames?, analysis_root?) -> {frames, diff?, grabbed_count}
+      grab_frames(frames, diff_pair?, max_width?, source?, allow_still_fallback?, max_frames?, analysis_root?) -> {frames, diff?, grabbed_count}
         Agent eyes: park the playhead on each frame (timeline-relative, as above), grab the
         GRADED frame, and write one small vision-ready PNG per frame (Read the returned paths
         as images to verify a change visually). Uses the Color-page thumbnail with a
         Project.ExportCurrentFrameAsStill fallback; page and playhead are restored after.
+        source: auto (default) | thumbnail | still. The thumbnail can be a stale cached image
+        (byte-identical across playheads) and never shows Fusion comps; auto detects identical
+        consecutive grabs and re-grabs those frames via still export (stale_thumbnail_detected
+        on the entry, stale_thumbnail_frames on the result). source='still' always uses still
+        export — pick it when frames must include Fusion comp output.
         diff_pair=[before, after] adds an amplified pixel-diff PNG plus
         {mean_abs_diff, changed_pct} for write→look→adjust loops.
       marker_thumbnail_review(max_samples?, analysis_root?) -> {path, samples, review_guidance}
