@@ -5807,6 +5807,140 @@ def _rgb_to_png_bytes(width: int, height: int, raw_rgb: bytes) -> bytes:
     )
 
 
+def _png_decode_rgb(png_bytes: bytes) -> Tuple[int, int, bytes]:
+    """Decode an 8-bit non-interlaced RGB/RGBA PNG to (width, height, raw_rgb).
+
+    Pure-stdlib counterpart of _rgb_to_png_bytes. grab_frames needs it to
+    downscale and pixel-diff stills written by Resolve itself
+    (Project.ExportCurrentFrameAsStill), and this venv has no PIL. Anything
+    outside 8-bit truecolor (palette, grayscale, 16-bit, interlaced) raises
+    ValueError so callers fall back to keeping the file untouched.
+    """
+    data = bytes(png_bytes) if isinstance(png_bytes, (bytes, bytearray)) else b""
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Not a PNG byte stream")
+    pos = 8
+    width = height = 0
+    bit_depth = color_type = interlace = None
+    idat = bytearray()
+    while pos + 8 <= len(data):
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        ctype = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if ctype == b"IHDR":
+            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", chunk)
+        elif ctype == b"IDAT":
+            idat.extend(chunk)
+        elif ctype == b"IEND":
+            break
+    if not width or not height or bit_depth is None:
+        raise ValueError("PNG missing IHDR")
+    if bit_depth != 8 or color_type not in (2, 6) or interlace != 0:
+        raise ValueError("Only 8-bit non-interlaced RGB/RGBA PNGs are supported")
+    channels = 3 if color_type == 2 else 4
+    stride = width * channels
+    raw = zlib.decompress(bytes(idat))
+    if len(raw) < (stride + 1) * height:
+        raise ValueError("PNG pixel data is shorter than expected")
+    out = bytearray(stride * height)
+    prev_start = None
+    for y in range(height):
+        row_start = y * (stride + 1)
+        filter_type = raw[row_start]
+        row = bytearray(raw[row_start + 1:row_start + 1 + stride])
+        out_start = y * stride
+        if filter_type == 0:
+            pass
+        elif filter_type == 1:  # Sub
+            for i in range(channels, stride):
+                row[i] = (row[i] + row[i - channels]) & 0xFF
+        elif filter_type == 2:  # Up
+            if prev_start is not None:
+                for i in range(stride):
+                    row[i] = (row[i] + out[prev_start + i]) & 0xFF
+        elif filter_type == 3:  # Average
+            for i in range(stride):
+                left = row[i - channels] if i >= channels else 0
+                up = out[prev_start + i] if prev_start is not None else 0
+                row[i] = (row[i] + (left + up) // 2) & 0xFF
+        elif filter_type == 4:  # Paeth
+            for i in range(stride):
+                left = row[i - channels] if i >= channels else 0
+                up = out[prev_start + i] if prev_start is not None else 0
+                up_left = out[prev_start + i - channels] if (prev_start is not None and i >= channels) else 0
+                p_est = left + up - up_left
+                pa, pb, pc = abs(p_est - left), abs(p_est - up), abs(p_est - up_left)
+                if pa <= pb and pa <= pc:
+                    predictor = left
+                elif pb <= pc:
+                    predictor = up
+                else:
+                    predictor = up_left
+                row[i] = (row[i] + predictor) & 0xFF
+        else:
+            raise ValueError(f"Unsupported PNG filter type {filter_type}")
+        out[out_start:out_start + stride] = row
+        prev_start = out_start
+    if channels == 3:
+        return width, height, bytes(out)
+    rgb = bytearray(width * height * 3)
+    for index in range(width * height):
+        rgb[index * 3:index * 3 + 3] = out[index * 4:index * 4 + 3]
+    return width, height, bytes(rgb)
+
+
+def _scale_rgb_to_max_width(width: int, height: int, raw_rgb: bytes, max_width: int) -> Tuple[int, int, bytes]:
+    """Nearest-neighbor downscale to at most max_width; no-op when small enough."""
+    max_width = int(max_width or 0)
+    if max_width <= 0 or width <= max_width:
+        return width, height, raw_rgb
+    new_w = max_width
+    new_h = max(1, round(height * new_w / width))
+    out = bytearray(new_w * new_h * 3)
+    for y in range(new_h):
+        src_y = min(height - 1, y * height // new_h)
+        for x in range(new_w):
+            src_x = min(width - 1, x * width // new_w)
+            src = (src_y * width + src_x) * 3
+            dst = (y * new_w + x) * 3
+            out[dst:dst + 3] = raw_rgb[src:src + 3]
+    return new_w, new_h, bytes(out)
+
+
+def _rgb_abs_diff(width: int, height: int, raw_a: bytes, raw_b: bytes, threshold: int = 8) -> Tuple[bytes, Dict[str, Any]]:
+    """Per-pixel absolute difference of two same-sized RGB buffers.
+
+    Returns (diff_rgb, stats). The diff image is amplified 4x so subtle grade
+    or transform drift is visible to a vision model; the stats are computed on
+    the raw deltas. changed_pct counts PIXELS whose largest channel delta
+    exceeds threshold, so compression noise below it does not read as change.
+    """
+    expected = width * height * 3
+    if len(raw_a) != expected or len(raw_b) != expected:
+        raise ValueError("diff needs two RGB buffers of identical dimensions")
+    diff = bytearray(expected)
+    total = 0
+    changed = 0
+    for index in range(0, expected, 3):
+        max_delta = 0
+        for channel in range(3):
+            delta = abs(raw_a[index + channel] - raw_b[index + channel])
+            total += delta
+            if delta > max_delta:
+                max_delta = delta
+            diff[index + channel] = min(255, delta * 4)
+        if max_delta > threshold:
+            changed += 1
+    pixels = width * height
+    stats = {
+        "mean_abs_diff": total / expected,
+        "changed_pct": round(changed * 100.0 / pixels, 2),
+        "threshold": threshold,
+    }
+    return bytes(diff), stats
+
+
 _TINY_FONT = {
     "A": ("111", "101", "111", "101", "101"), "B": ("110", "101", "110", "101", "110"),
     "C": ("111", "100", "100", "100", "111"), "D": ("110", "101", "101", "101", "110"),
@@ -6050,6 +6184,189 @@ def _timeline_marker_thumbnail_review(proj, tl, p: Dict[str, Any]) -> Dict[str, 
         },
     }
     return review
+
+
+def _grab_frames_still_fallback(proj, path: str, max_width: int, entry: Dict[str, Any]) -> Optional[Tuple[int, int, bytes]]:
+    """Export the current frame via Project.ExportCurrentFrameAsStill into path.
+
+    This is the fallback when the Color-page thumbnail is unavailable — chosen
+    over GalleryStillAlbum.ExportStills, whose api_truth entry records it as
+    panel-dependent and unusable unattended, while ExportCurrentFrameAsStill
+    is verified in both GUI and headless modes. Returns decoded (w, h, rgb)
+    when the still could be read back for downscale/diff, else None (the
+    full-resolution file is still kept and reported).
+    """
+    try:
+        exported = bool(proj.ExportCurrentFrameAsStill(path))
+    except Exception as exc:
+        entry["error"] = f"ExportCurrentFrameAsStill raised: {exc}"
+        return None
+    if not exported or not os.path.exists(path):
+        entry["error"] = (
+            "Frame grab failed: no Color-page thumbnail and "
+            "ExportCurrentFrameAsStill wrote nothing"
+        )
+        return None
+    try:
+        with open(path, "rb") as handle:
+            width, height, raw = _png_decode_rgb(handle.read())
+    except (ValueError, OSError, zlib.error):
+        entry.update({"path": path, "source": "still_export", "full_resolution": True})
+        return None
+    width, height, raw = _scale_rgb_to_max_width(width, height, raw, max_width)
+    try:
+        with open(path, "wb") as handle:
+            handle.write(_rgb_to_png_bytes(width, height, raw))
+    except OSError as exc:
+        entry["error"] = f"Failed to rewrite downscaled still: {exc}"
+        return None
+    entry.update({"path": path, "width": width, "height": height, "source": "still_export"})
+    return width, height, raw
+
+
+def _timeline_grab_frames(proj, tl, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Agent eyes: grab timeline frames as small vision-ready PNG files.
+
+    Parks the playhead on each requested frame inside the Color-page context
+    (page and playhead restored afterwards), grabs the graded frame via
+    GetCurrentClipThumbnailImage with an ExportCurrentFrameAsStill fallback,
+    and writes one PNG per frame. Optionally also writes an amplified
+    pixel-diff of a before/after pair.
+    """
+    frames = p.get("frames")
+    if not isinstance(frames, list):
+        return _err("frames must be a list of timeline-relative frame numbers")
+    diff_pair = _first_param(p, "diff_pair", "diffPair")
+    if diff_pair is not None and (not isinstance(diff_pair, list) or len(diff_pair) != 2):
+        return _err("diff_pair must be a two-frame list: [before, after]")
+    max_width = int(_first_param(p, "max_width", "maxWidth", default=640) or 0)
+    allow_still_fallback = bool(_first_param(p, "allow_still_fallback", "allowStillFallback", default=True))
+    frame_cap = max(1, min(int(_first_param(p, "max_frames", "maxFrames", default=24) or 24), 48))
+
+    requested: List[int] = []
+    for frame in list(frames) + (list(diff_pair) if diff_pair else []):
+        frame_id = _frame_int(frame)
+        if frame_id is None:
+            return _err(f"frames must be integers (timeline-relative), got {frame!r}")
+        if frame_id not in requested:
+            requested.append(frame_id)
+    if not requested:
+        return _err("No frames requested: pass frames=[...] and/or diff_pair=[before, after]")
+    if len(requested) > frame_cap:
+        return _err(f"Too many frames requested ({len(requested)} > {frame_cap}); batch the call or raise max_frames (hard cap 48)")
+
+    project_name, project_id = _project_name_and_id(proj)
+    root = resolve_media_analysis_output_root(
+        project_name=project_name,
+        project_id=project_id,
+        analysis_root=p.get("analysis_root"),
+        source_paths=[],
+        create=True,
+    )
+    if not root.get("success"):
+        return root
+    frames_dir = os.path.join(root["project_root"], "timeline-frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    slug = slugify(tl.GetName() or "timeline")
+    stamp = int(time.time())
+
+    original_timecode = None
+    try:
+        original_timecode = tl.GetCurrentTimecode()
+    except Exception:
+        pass
+
+    entries: List[Dict[str, Any]] = []
+    raws: Dict[int, Tuple[int, int, bytes]] = {}
+    with _color_page_for_thumbnails(get_resolve()) as on_color:
+        try:
+            for frame_id in requested:
+                entry: Dict[str, Any] = {"frame": frame_id}
+                entries.append(entry)
+                timecode, tc_err = _timeline_frame_id_to_timecode(tl, _marker_display_frame(tl, frame_id))
+                if tc_err:
+                    entry["error"] = tc_err.get("error")
+                    continue
+                entry["timecode"] = timecode
+                try:
+                    tl.SetCurrentTimecode(timecode)
+                except Exception as exc:
+                    entry["error"] = f"SetCurrentTimecode failed: {exc}"
+                    continue
+                path = os.path.join(frames_dir, f"{slug}-f{frame_id}-{stamp}.png")
+                thumbnail = None
+                try:
+                    thumbnail = tl.GetCurrentClipThumbnailImage()
+                except Exception:
+                    thumbnail = None
+                if thumbnail:
+                    try:
+                        width, height, raw = _thumbnail_raw_rgb(thumbnail)
+                        width, height, raw = _scale_rgb_to_max_width(width, height, raw, max_width)
+                        with open(path, "wb") as handle:
+                            handle.write(_rgb_to_png_bytes(width, height, raw))
+                        raws[frame_id] = (width, height, raw)
+                        entry.update({"path": path, "width": width, "height": height, "source": "thumbnail"})
+                        continue
+                    except (ValueError, OSError) as exc:
+                        entry["thumbnail_error"] = str(exc)
+                if not allow_still_fallback:
+                    entry["error"] = (
+                        "No thumbnail at frame and still fallback disabled"
+                        if on_color
+                        else "No thumbnail: GetCurrentClipThumbnailImage requires the "
+                        "Color page and automatic switching failed (headless or page locked); "
+                        "still fallback disabled"
+                    )
+                    continue
+                decoded = _grab_frames_still_fallback(proj, path, max_width, entry)
+                if decoded is not None:
+                    raws[frame_id] = decoded
+        finally:
+            if original_timecode:
+                try:
+                    tl.SetCurrentTimecode(original_timecode)
+                except Exception:
+                    pass
+
+    grabbed = [entry for entry in entries if entry.get("path")]
+    result: Dict[str, Any] = {
+        "success": bool(grabbed),
+        "frames": entries,
+        "grabbed_count": len(grabbed),
+        "project_root": root["project_root"],
+    }
+    if not grabbed:
+        result["error"] = (
+            "No frames could be grabbed"
+            if on_color
+            else "No frames could be grabbed: GetCurrentClipThumbnailImage requires the "
+            "Color page and automatic switching failed (headless or page locked)"
+        )
+    if diff_pair:
+        frame_a, frame_b = _frame_int(diff_pair[0]), _frame_int(diff_pair[1])
+        pair_a, pair_b = raws.get(frame_a), raws.get(frame_b)
+        if not pair_a or not pair_b:
+            result["diff"] = {"error": "diff_pair frames were not both grabbed with decodable pixels"}
+        elif pair_a[:2] != pair_b[:2]:
+            result["diff"] = {
+                "error": f"diff_pair frames have different dimensions ({pair_a[0]}x{pair_a[1]} vs {pair_b[0]}x{pair_b[1]})"
+            }
+        else:
+            width, height = pair_a[0], pair_a[1]
+            diff_raw, stats = _rgb_abs_diff(width, height, pair_a[2], pair_b[2])
+            diff_path = os.path.join(frames_dir, f"{slug}-diff-f{frame_a}-vs-f{frame_b}-{stamp}.png")
+            with open(diff_path, "wb") as handle:
+                handle.write(_rgb_to_png_bytes(width, height, diff_raw))
+            result["diff"] = {
+                "frame_a": frame_a,
+                "frame_b": frame_b,
+                "path": diff_path,
+                "width": width,
+                "height": height,
+                **stats,
+            }
+    return result
 
 
 def _audio_mix_capability_report(proj, mp, tl, p: Dict[str, Any]) -> Dict[str, Any]:
@@ -21542,7 +21859,7 @@ _TIMELINE_ACTIONS = [
     "duplicate_clips", "copy_clips", "move_clips", "copy_range", "duplicate_range",
     "overwrite_range", "lift_range", "story_spine_report", "create_variant_from_ranges",
     "bulk_set_item_properties", "apply_look_to_items", "thumbnail_contact_sheet",
-    "marker_thumbnail_review", "edit_kernel_capabilities", "probe_edit_kernel_item",
+    "grab_frames", "marker_thumbnail_review", "edit_kernel_capabilities", "probe_edit_kernel_item",
     "title_property_scan", "set_title_text", "bulk_set_title_text", "create_compound_clip",
     "create_fusion_clip", "import_into_timeline", "export", "get_setting", "set_setting",
     "insert_generator", "insert_fusion_generator", "insert_fusion_composition",
@@ -21641,6 +21958,13 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         # example: action_help(name='<action_name>')
       thumbnail_contact_sheet(frames?|max_samples?, analysis_root?) -> {path, samples}
         frames are relative to the timeline start (frame 0 = first frame), like marker frameIds.
+      grab_frames(frames, diff_pair?, max_width?, allow_still_fallback?, max_frames?, analysis_root?) -> {frames, diff?, grabbed_count}
+        Agent eyes: park the playhead on each frame (timeline-relative, as above), grab the
+        GRADED frame, and write one small vision-ready PNG per frame (Read the returned paths
+        as images to verify a change visually). Uses the Color-page thumbnail with a
+        Project.ExportCurrentFrameAsStill fallback; page and playhead are restored after.
+        diff_pair=[before, after] adds an amplified pixel-diff PNG plus
+        {mean_abs_diff, changed_pct} for write→look→adjust loops.
       marker_thumbnail_review(max_samples?, analysis_root?) -> {path, samples, review_guidance}
       edit_kernel_capabilities() -> {supported, partially_supported, unsupported}
       probe_edit_kernel_item(clip_ids? selected? timeline_item?) -> {items, count}
@@ -21967,6 +22291,8 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         return _timeline_apply_look_to_items(tl, p)
     elif action == "thumbnail_contact_sheet":
         return _timeline_thumbnail_contact_sheet(proj, tl, p)
+    elif action == "grab_frames":
+        return _timeline_grab_frames(proj, tl, p)
     elif action == "marker_thumbnail_review":
         return _timeline_marker_thumbnail_review(proj, tl, p)
     elif action == "edit_kernel_capabilities":
