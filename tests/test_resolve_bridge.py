@@ -376,6 +376,22 @@ class _FakeClip:
     def GetClipProperty(self): return {"File Path": self._path, "Duration": "00:00:10:00", "FPS": "24"}
 
 
+class _FakeSplineTool:
+    """The BezierSpline modifier tool: where DeleteKeyFrames actually lives
+    (Fusion Inputs have no keyframe-removal method — measured on 21.0.3.7)."""
+
+    def __init__(self, inp): self._inp = inp
+    def DeleteKeyFrames(self, time):
+        # Exact-key delete; silently a no-op when there is no key at `time`.
+        self._inp.keyed.pop(time, None)
+        return None
+
+
+class _FakeSplineOutput:
+    def __init__(self, spline): self._spline = spline
+    def GetTool(self): return self._spline
+
+
 class _FakeFusionInput:
     """A Fusion Input: subscriptable by time, methods reachable normally."""
 
@@ -419,7 +435,8 @@ class _FakeFusionTool:
             return lambda: dict(self.attrs)
         if name == "AddModifier":
             def _add_modifier(input_name, modifier):
-                self.inputs[input_name].modifier = modifier
+                inp = self.inputs[input_name]
+                inp.modifier = _FakeSplineOutput(_FakeSplineTool(inp))
                 return True
             return _add_modifier
         raise AttributeError(name)
@@ -1445,6 +1462,24 @@ class FusionOverBridgeTests(unittest.TestCase):
         tool["Size"][24] = 1.0
         self.assertEqual(inp[12], 0.5)
         self.assertEqual(tool.GetInput("Size", 24), 1.0)
+
+    def test_the_exact_delete_keyframe_sequence_works_over_the_bridge(self) -> None:
+        # Verbatim the shape of the server's fusion_comp delete_keyframe
+        # handler — the spline route, since Inputs have no RemoveKeyFrame.
+        # This chain (input -> connected output -> spline tool -> method that
+        # only exists on the far side) is exactly what failed live as
+        # "PyRemoteObject has no callable 'RemoveKeyFrame'".
+        tool = self._tool()
+        inp = tool["Size"]
+        if not inp.GetConnectedOutput():
+            self.assertTrue(tool.AddModifier("Size", "BezierSpline"))
+        tool["Size"][30] = 0.25
+        tool["Size"][60] = 0.75
+        spline = inp.GetConnectedOutput().GetTool()
+        spline.DeleteKeyFrames(30)
+        frames = list((inp.GetKeyFrames() or {}).values())
+        self.assertNotIn(30, frames)
+        self.assertIn(60, frames)
 
     def test_get_keyframes_round_trips_even_with_stringified_indices(self) -> None:
         tool = self._tool()

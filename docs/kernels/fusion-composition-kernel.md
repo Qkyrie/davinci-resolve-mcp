@@ -101,6 +101,20 @@ in success and in error responses.
   (`SetAttrs`, `AddModifier`, `GetKeyFrames` are real yet unlisted). A bridge
   runtime installed before these operations existed refuses with a message
   naming the fix (re-run `install.py`, then reload the bridge).
+- **Keyframe deletion is a spline-tool operation, not an Input one.** Fusion
+  `Input` objects expose no keyframe-removal method in any measured build
+  (21.0.3.7: no `RemoveKeyFrame` anywhere on the Input surface). The working
+  idiom — what `delete_keyframe` does — is
+  `input.GetConnectedOutput().GetTool().DeleteKeyFrames(time)`: single-arg,
+  removes exactly the key at that time, and silently no-ops when there is
+  none, so the action verifies existence before and removal after.
+- **Converting a static input seeds a stray keyframe.** `AddModifier(...,
+  "BezierSpline")` on a previously static input creates a key at the comp's
+  stored `CurrentTime` carrying the old static value. `add_keyframe` removes
+  it (reported as `removed_seed_keyframes` in the result) so first-time
+  animation yields exactly the requested key — scoped to the default
+  `BezierSpline` modifier; custom modifiers (e.g. `Path`) keep whatever keys
+  Fusion creates.
 - Keyframing is the **Fusion route only**: Resolve's API has no TimelineItem
   keyframe methods on any edition or build, so Edit-page transform keyframes
   cannot be scripted directly — animate in the clip's comp instead

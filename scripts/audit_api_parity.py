@@ -150,7 +150,11 @@ ALLOWLIST_UNDOCUMENTED: Set[str] = {
     "AddTool", "FindTool", "GetTool", "GetToolList", "Delete", "GetAttrs",
     "SetAttrs", "GetCurrentComp", "GetInput", "GetInputList", "GetOutput",
     "GetOutputList", "GetConnectedOutput", "SetInput", "GetKeyFrames",
-    "RemoveKeyFrame", "AddModifier", "Render", "StartUndo",
+    "DeleteKeyFrames", "AddModifier", "Render", "StartUndo",
+    # NOT here: RemoveKeyFrame. It sat on this list as "Fusion API" while being
+    # a phantom — measured live on 21.0.3.7, Fusion Inputs expose no
+    # keyframe-removal method at all; deletion is DeleteKeyFrames on the
+    # spline tool reached via GetConnectedOutput().GetTool().
     # UIManager / Resolve app-control API (documented under UIManager, not
     # the main Resolve scripting README)
     "GetUIManager", "OpenPreferences", "SetHighPriority",

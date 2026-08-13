@@ -25725,9 +25725,13 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
       get_input(tool_name, input_name, time?) -> {value}
       set_attrs(tool_name, attrs) -> {success}
       get_attrs(tool_name) -> {attrs}
-      add_keyframe(tool_name, input_name, time, value) -> {success}
+      add_keyframe(tool_name, input_name, time, value) -> {success, removed_seed_keyframes?}
+        First animation of a static input also removes the stray key Fusion
+        seeds at the comp's CurrentTime (BezierSpline modifier only).
       get_keyframes(tool_name, input_name) -> {keyframes}
       delete_keyframe(tool_name, input_name, time) -> {success}
+        Deletes via the animating spline tool (Inputs have no removal method);
+        errors if the input is static or has no key at `time`.
       get_comp_info() -> {name, tool_count, attrs}
       get_position(tool_name) -> {tool_name, x, y}  — read a node's FlowView position
       set_position(tool_name, x, y) -> {success, x, y, readback}  — move a node
@@ -25993,6 +25997,21 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             if not _already_animated:
                 tool.AddModifier(p["input_name"], p.get("modifier", "BezierSpline"))
             tool[p["input_name"]][p["time"]] = p["value"]
+            # Converting a static input seeds the fresh BezierSpline with a
+            # keyframe at the comp's stored CurrentTime carrying the old static
+            # value (measured live on 21.0.3.7). Nobody asked for that key, so
+            # drop everything except the keyframe just written. Scoped to the
+            # default modifier: seed behaviour is unmeasured for e.g. Path.
+            if not _already_animated and p.get("modifier", "BezierSpline") == "BezierSpline":
+                strays = [f for f in (inp.GetKeyFrames() or {}).values()
+                          if float(f) != float(p["time"])]
+                if strays:
+                    out = inp.GetConnectedOutput()
+                    spline = out.GetTool() if out else None
+                    if spline:
+                        for f in strays:
+                            spline.DeleteKeyFrames(f)
+                        return _ok(removed_seed_keyframes=strays)
             return _ok()
         finally:
             comp.Unlock()
@@ -26028,7 +26047,28 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             inp = tool[p["input_name"]]
             if not inp:
                 return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
-            inp.RemoveKeyFrame(p["time"])
+            # Fusion Inputs have no keyframe-removal method (measured live on
+            # 21.0.3.7: no RemoveKeyFrame anywhere on the Input surface).
+            # Deletion lives on the animating spline tool:
+            # GetConnectedOutput() -> GetTool() -> DeleteKeyFrames(time), which
+            # removes exactly the key at that time — and silently no-ops when
+            # there is none, so existence is checked here to keep the result
+            # honest in both directions.
+            out = inp.GetConnectedOutput()
+            if not out:
+                return _err(f"Input '{p['input_name']}' is not animated — no keyframes to delete")
+            target = float(p["time"])
+            frames = (inp.GetKeyFrames() or {}).values()
+            if not any(float(f) == target for f in frames):
+                return _err(f"No keyframe at time {p['time']} on input '{p['input_name']}'")
+            spline = out.GetTool()
+            if not spline:
+                return _err(f"Input '{p['input_name']}' is animated but its modifier tool is unreachable")
+            spline.DeleteKeyFrames(p["time"])
+            remaining = (inp.GetKeyFrames() or {}).values()
+            if any(float(f) == target for f in remaining):
+                return _err(f"Fusion did not remove the keyframe at time {p['time']} — "
+                            "the input's modifier may not support DeleteKeyFrames")
             return _ok()
         finally:
             comp.Unlock()
