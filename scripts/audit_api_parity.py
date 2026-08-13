@@ -138,13 +138,19 @@ def find_methods_missing_from_source(
 # in docs/reference/resolve_scripting_api.txt.
 ALLOWLIST_UNDOCUMENTED: Set[str] = {
     # Fusion API (documented in Blackmagic's Fusion scripting docs, not in
-    # the Resolve scripting README that ships alongside Resolve)
+    # the Resolve scripting README that ships alongside Resolve).
+    #
+    # LESSON — this list is name-based, not per-object, which is a blind spot:
+    # it once carried AddKeyframe/DeleteKeyframe/ModifyKeyframe/GetKeyframeCount/
+    # GetKeyframeAtIndex/GetPropertyAtKeyframeIndex/SetKeyframeInterpolation as
+    # "Fusion API" while the code called them on TimelineItem, where they do not
+    # exist in any Resolve build (see docs/reference/api-limitations.md,
+    # TimelineItem keyframes). Only allowlist a name here after checking every
+    # call site really is a Fusion (or otherwise-documented) object.
     "AddTool", "FindTool", "GetTool", "GetToolList", "Delete", "GetAttrs",
     "SetAttrs", "GetCurrentComp", "GetInput", "GetInputList", "GetOutput",
     "GetOutputList", "GetConnectedOutput", "SetInput", "GetKeyFrames",
-    "AddKeyframe", "DeleteKeyframe", "ModifyKeyframe", "RemoveKeyFrame",
-    "GetKeyframeAtIndex", "GetKeyframeCount", "GetPropertyAtKeyframeIndex",
-    "SetKeyframeInterpolation", "Render", "StartUndo",
+    "RemoveKeyFrame", "AddModifier", "Render", "StartUndo",
     # UIManager / Resolve app-control API (documented under UIManager, not
     # the main Resolve scripting README)
     "GetUIManager", "OpenPreferences", "SetHighPriority",

@@ -1372,7 +1372,9 @@ Key actions:
   `markers`, `flags`, `enabled`, `cache`, `voice_isolation`, `fusion`,
   `grades`, `takes`, and `keyframes`; `transitions` is accepted but reported
   unsupported because Resolve's public scripting API does not expose transition
-  cloning. `copy_keyframes=True` adds the `keyframes` group.
+  cloning, and `keyframes` is likewise always reported unavailable — the API
+  has no TimelineItem keyframe methods (see `docs/reference/api-limitations.md`).
+  `copy_keyframes=True` adds the `keyframes` group.
 - `copy_clips(...)` / `move_clips(...)` — same safe append path; `move_clips`
   deletes successfully duplicated source items afterward
 - `copy_range` / `duplicate_range` — copy exact video/audio source segments
@@ -1403,8 +1405,9 @@ Key actions:
   unsupported timeline edit kernel behavior
 - `probe_edit_kernel_item(clip_ids? selected? timeline_item?)` — read-only
   capability/property probe for timeline items, including available item
-  methods, `GetProperty()` values, known property keys, keyframe counts, and
-  linked item summaries
+  methods, `GetProperty()` values, known property keys, and linked item
+  summaries (the keyframe section always reports the TimelineItem keyframe
+  API gap)
 - `title_property_scan(clip_id|timeline_item_id|timeline_item)` — inspect
   undocumented Edit-page title/generator `TimelineItem.GetProperty()` keys
 - `set_title_text(clip_id|..., text, property_key?, as_styled_xml?, try_plain_first?, try_heuristic_keys?, readback?)`
@@ -1525,9 +1528,13 @@ Key actions:
 - `get_audio` / `set_audio(Volume?, Pan?, AudioSyncOffset?)`
 - `get_voice_isolation_state` / `set_voice_isolation_state(state)` — Resolve
   20.1+; audio timeline items only
-- `get_keyframes(property)`, `add_keyframe(property, frame, value)`,
-  `modify_keyframe`, `delete_keyframe`, `set_keyframe_interpolation`
-  - interpolation values: `"Linear"`, `"Bezier"`, `"EaseIn"`, `"EaseOut"`, `"EaseInOut"`
+- `get_keyframes` / `add_keyframe` / `modify_keyframe` / `delete_keyframe` /
+  `set_keyframe_interpolation` — always refuse with an explanation: Resolve's
+  API has NO TimelineItem keyframe methods on any edition or build (its only
+  keyframe API is `Resolve.Get/SetKeyframeMode`, a UI-mode switch). Animate
+  via the clip's Fusion comp — `fusion_comp(action="add_keyframe")` on e.g. a
+  Transform tool; static values stay settable via `set_transform`/`set_crop`/
+  `set_composite`. See `docs/reference/api-limitations.md`.
 - `get_unique_id` — use this to get the ID for other tool calls
 - `get_media_pool_item` — get the source clip from the Media Pool
 

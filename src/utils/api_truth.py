@@ -1988,6 +1988,40 @@ API_TRUTH: List[Dict[str, Any]] = [
         "tags": ["gallery", "stills", "headless", "unreliable-return"],
         "submit": "bug",
     },
+    {
+        "symbol": "TimelineItem keyframes (AddKeyframe, ModifyKeyframe, DeleteKeyframe, "
+                  "GetKeyframeCount, GetKeyframeAtIndex, GetPropertyAtKeyframeIndex, "
+                  "SetKeyframeInterpolation)",
+        "object": "TimelineItem",
+        "reality": "None of these methods exist, on any edition or build — the "
+                   "phantom family this server shipped for its entire history. "
+                   "The bundled API reference (Last Updated 24 Jul 2026) has no "
+                   "TimelineItem keyframe surface at all; the ONLY keyframe API "
+                   "Resolve exposes is Resolve.Get/SetKeyframeMode, which "
+                   "switches the Edit-page keyframe UI MODE and touches no "
+                   "keyframe data. Confirmed live 2026-08-13 through the "
+                   "bridge's dir() audit: TimelineItem lists no keyframe "
+                   "method. The absence is easy to mis-diagnose from outside "
+                   "because native fusionscript fabricates a callable for any "
+                   "attribute name, so callable(getattr(item, 'AddKeyframe')) "
+                   "is True while the call itself fails — which is how phantom "
+                   "wrappers survived here unchallenged: the failure read as a "
+                   "per-build capability gap ('not supported in this Resolve "
+                   "build') rather than as a method that never existed. Edit-"
+                   "page transform/crop/composite values are scriptable only "
+                   "as STATIC values through SetProperty.",
+        "recommended": "Animate through the clip's Fusion comp instead, which "
+                       "IS scriptable and persists: add a Transform (or "
+                       "target the Text+ Template) and keyframe its inputs "
+                       "via AddModifier('BezierSpline') + input[time] = value "
+                       "(fusion_comp add_keyframe). For titles needing "
+                       "placement on a chosen track, combine with the nested-"
+                       "timeline route (see the Track Selector entry). The "
+                       "timeline_item keyframe actions now refuse with this "
+                       "explanation instead of calling the phantom methods.",
+        "tags": ["timeline-item", "keyframes", "missing-method", "phantom-wrapper"],
+        "submit": "missing",
+    },
 ]
 
 

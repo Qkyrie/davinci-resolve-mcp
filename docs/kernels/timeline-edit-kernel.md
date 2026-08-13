@@ -117,7 +117,8 @@ item APIs for the current item type and page state:
 
 `copy_properties=True` copies all supported groups. A list or comma-separated
 string can scope copying to specific groups. `copy_keyframes=True` adds the
-`keyframes` group.
+`keyframes` group, which is always reported unavailable: Resolve's API has no
+TimelineItem keyframe methods (see `docs/reference/api-limitations.md`).
 
 ### Capability reporting
 
@@ -126,7 +127,8 @@ map for supported, partially supported, and unsupported behavior.
 
 `timeline(action="probe_edit_kernel_item")` is a read-only item probe. It
 reports method availability, `GetProperty()` output, known property values,
-keyframe counts, and linked item summaries.
+and linked item summaries (its keyframe section always reports the
+TimelineItem keyframe API gap).
 
 `timeline(action="title_property_scan")` inspects undocumented title and
 generator `TimelineItem.GetProperty()` keys for the selected item scope.
@@ -150,22 +152,26 @@ Current partial areas:
   page, and Resolve build.
 - Cache and voice isolation: copied only when item-level read/write APIs are
   callable for the item.
-- Keyframes: copied for exposed properties, but Resolve does not expose enough
-  interpolation detail for full-fidelity readback in every case.
 
 ## Unsupported Boundaries
 
 These are blocked by Resolve's public scripting API, not by MCP plumbing:
 
 - Transition cloning: no public timeline-item transition clone/read/write API.
+- Keyframe cloning and Edit-page keyframing generally: TimelineItem has no
+  keyframe methods in any Resolve build (`AddKeyframe`/`GetKeyframeCount` and
+  friends do not exist — an earlier revision of this kernel claimed keyframes
+  were "copied for exposed properties", which was never true). Animate via the
+  clip's Fusion comp instead (`fusion_comp` `add_keyframe`); see
+  `docs/reference/api-limitations.md`.
 - Razor/split edits: no direct public timeline split primitive.
 - True partial lift: no safe partial-item delete without a split primitive.
 - Source-less item cloning through append: titles, generators, Fusion
   compositions, and subtitles can exist on the timeline, but source-less items
   do not provide a Media Pool item that `AppendToTimeline([{clipInfo}])` can
   clone.
-- Deep speed-ramp semantics: exposed retime properties and supported keyframes
-  can be copied, but opaque speed-ramp curves are not independently inspectable.
+- Deep speed-ramp semantics: exposed retime properties can be copied, but
+  opaque speed-ramp curves are not independently inspectable.
 
 ## Version/Page Dependent Behavior
 

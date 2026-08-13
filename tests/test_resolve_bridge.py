@@ -359,6 +359,7 @@ class _FakeTimeline:
     def GetTrackName(self, kind, index): return f"{kind}{index}"
     def GetIsTrackEnabled(self, kind, index): return True
     def GetIsTrackLocked(self, kind, index): return False
+    def GetItemListInTrack(self, kind, index): return [_FakeTimelineItem()]
 
 
 class _FakeFolder:
@@ -373,6 +374,70 @@ class _FakeClip:
     def GetName(self): return self._name
     def GetUniqueId(self): return f"clip-{self._name}"
     def GetClipProperty(self): return {"File Path": self._path, "Duration": "00:00:10:00", "FPS": "24"}
+
+
+class _FakeFusionInput:
+    """A Fusion Input: subscriptable by time, methods reachable normally."""
+
+    def __init__(self, name):
+        self._name = name
+        self.keyed = {}
+        self.modifier = None
+
+    def __getitem__(self, time): return self.keyed.get(time)
+    def __setitem__(self, time, value): self.keyed[time] = value
+    def GetConnectedOutput(self): return self.modifier
+    def GetKeyFrames(self):
+        return {i + 1: t for i, t in enumerate(sorted(self.keyed))}
+
+
+class _FakeFusionTool:
+    """A Fusion Tool with the measured live pathology: `SetAttrs`/`AddModifier`
+    are real, working methods that `dir()` does NOT list (they resolve through
+    `__getattr__`), which is exactly what breaks the strict attribute gate."""
+
+    def __init__(self, name):
+        self._name = name
+        self.attrs = {}
+        self.inputs = {"Size": _FakeFusionInput("Size")}
+
+    def __getitem__(self, key):
+        # Fusion (Lua-table) semantics: a missing input reads as nil, not a raise.
+        return self.inputs.get(key)
+
+    def GetInput(self, name, time=None):
+        inp = self.inputs.get(name)
+        return None if inp is None else inp[time]
+
+    def __getattr__(self, name):
+        if name == "SetAttrs":
+            def _set_attrs(table):
+                self.attrs.update(table)
+                return True
+            return _set_attrs
+        if name == "GetAttrs":
+            return lambda: dict(self.attrs)
+        if name == "AddModifier":
+            def _add_modifier(input_name, modifier):
+                self.inputs[input_name].modifier = modifier
+                return True
+            return _add_modifier
+        raise AttributeError(name)
+
+
+class _FakeFusionComp:
+    def __init__(self): self._tools = {"Template": _FakeFusionTool("Template")}
+    def FindTool(self, name): return self._tools.get(name)
+    def Lock(self): return True
+    def Unlock(self): return True
+
+
+class _FakeTimelineItem:
+    def __init__(self): self._comp = _FakeFusionComp()
+    def GetName(self): return "title"
+    def GetUniqueId(self): return "item-title"
+    def GetFusionCompCount(self): return 1
+    def GetFusionCompByIndex(self, index): return self._comp if index == 1 else None
 
 
 class OperationSurfaceTests(unittest.TestCase):
@@ -1333,6 +1398,114 @@ class ProxyTests(unittest.TestCase):
         )
         with self.assertRaises(self.rbc.BridgeUnavailable):
             self.rbc.BridgeProxy(dead, "resolve").GetProductName()
+
+
+class FusionOverBridgeTests(unittest.TestCase):
+    """The Fusion object model — subscripting and dir()-invisible methods —
+    works over the bridge exactly as it does natively.
+
+    This is the surface that failed live as "not supported in this Resolve
+    build" while being fully supported: the proxy had no `__getitem__`, and its
+    strict dir() gate refused Fusion methods that dir() under-reports.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import tempfile
+        from src.utils import resolve_bridge_client as rbc
+        from src.utils import resolve_bridge_ops as rbo
+
+        cls.rbc, cls.rbo = rbc, rbo
+        cls.root = tempfile.mkdtemp(prefix="fusion_bridge_")
+        cls.fake = FakeResolve()
+        cls.ops = rbo.ResolveOperations(cls.fake, media_roots=[cls.root], output_roots=[cls.root])
+        config = {"host": "127.0.0.1", "port": 0, "token": TOKEN, "auth_clock_skew_seconds": 60}
+        cls.bridge = rb.Bridge(cls.fake, config, rbo.make_dispatch(cls.ops))
+        cls.bridge.start()
+        cls.transport = rbc.BridgeTransport({**config, "port": cls.bridge.port})
+        cls.resolve = rbc.BridgeProxy(cls.transport, "resolve")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.bridge.stop()
+
+    def _tool(self):
+        item = (self.resolve.GetProjectManager().GetCurrentProject()
+                .GetCurrentTimeline().GetItemListInTrack("video", 1)[0])
+        return item.GetFusionCompByIndex(1).FindTool("Template")
+
+    def test_the_exact_add_keyframe_sequence_works_over_the_bridge(self) -> None:
+        # Verbatim the shape of the server's fusion_comp add_keyframe handler.
+        tool = self._tool()
+        inp = tool["Size"]
+        self.assertIsNotNone(inp)
+        if not inp.GetConnectedOutput():
+            self.assertTrue(tool.AddModifier("Size", "BezierSpline"))
+        tool["Size"][12] = 0.5
+        tool["Size"][24] = 1.0
+        self.assertEqual(inp[12], 0.5)
+        self.assertEqual(tool.GetInput("Size", 24), 1.0)
+
+    def test_get_keyframes_round_trips_even_with_stringified_indices(self) -> None:
+        tool = self._tool()
+        for time in (5, 10, 15):
+            tool["Size"][time] = time / 10.0
+        kfs = tool["Size"].GetKeyFrames()
+        # JSON forced the 1-based integer indices to strings; the values (frame
+        # positions) must still come back intact and complete.
+        self.assertEqual(sorted(kfs.values()), [5, 10, 15])
+
+    def test_a_method_dir_does_not_list_is_still_callable_on_fusion_objects(self) -> None:
+        # SetAttrs/GetAttrs resolve through __getattr__ on the fake, exactly
+        # like the live pathology: real and working, but absent from dir().
+        tool = self._tool()
+        self.assertNotIn("SetAttrs", dir(self.fake.GetCurrentTimeline()
+                                         .GetItemListInTrack("video", 1)[0]
+                                         .GetFusionCompByIndex(1).FindTool("Template")))
+        self.assertTrue(tool.SetAttrs({"TOOLS_Name": "Renamed"}))
+        self.assertEqual(tool.GetAttrs().get("TOOLS_Name"), "Renamed")
+
+    def test_a_missing_input_reads_as_none_like_native_fusion(self) -> None:
+        self.assertIsNone(self._tool()["NoSuchInput"])
+
+    def test_subscripting_a_non_subscriptable_object_is_a_clear_error(self) -> None:
+        with self.assertRaises(self.rbc.BridgeCallError) as ctx:
+            self.resolve["Size"]
+        self.assertEqual(ctx.exception.code, "capability_unavailable")
+        self.assertIn("subscript", ctx.exception.message)
+
+    def test_private_subscript_keys_are_refused(self) -> None:
+        tool = self._tool()
+        with self.assertRaises(self.rbc.BridgeCallError) as ctx:
+            tool["_private"]
+        self.assertEqual(ctx.exception.code, "method_not_allowed")
+
+    def test_capability_detection_outside_fusion_is_still_strict(self) -> None:
+        # The relaxation is scoped by provenance: a Timeline still answers
+        # hasattr truthfully, or the ~50 getattr(obj, name, None) capability
+        # checks in the server would silently pass everywhere.
+        timeline = (self.resolve.GetProjectManager().GetCurrentProject()
+                    .GetCurrentTimeline())
+        self.assertIsNone(getattr(timeline, "CreateMagicMask", None))
+
+    def test_a_stale_bridge_without_get_item_says_what_fixes_it(self) -> None:
+        class OldOps(self.rbo.ResolveOperations):
+            OPERATIONS = tuple(op for op in self.rbo.ResolveOperations.OPERATIONS
+                               if op not in ("get_item", "set_item"))
+
+        old = OldOps(FakeResolve(), media_roots=[self.root], output_roots=[self.root])
+        config = {"host": "127.0.0.1", "port": 0, "token": TOKEN, "auth_clock_skew_seconds": 60}
+        bridge = rb.Bridge(old.resolve, config, self.rbo.make_dispatch(old))
+        bridge.start()
+        self.addCleanup(bridge.stop)
+        proxy = self.rbc.BridgeProxy(
+            self.rbc.BridgeTransport({**config, "port": bridge.port}), "resolve")
+        tool = (proxy.GetProjectManager().GetCurrentProject().GetCurrentTimeline()
+                .GetItemListInTrack("video", 1)[0].GetFusionCompByIndex(1).FindTool("Template"))
+        with self.assertRaises(self.rbc.BridgeCallError) as ctx:
+            tool["Size"]
+        self.assertEqual(ctx.exception.code, "operation_not_allowed")
+        self.assertIn("install.py", ctx.exception.message)
 
 
 class BridgeForceFlagTests(unittest.TestCase):

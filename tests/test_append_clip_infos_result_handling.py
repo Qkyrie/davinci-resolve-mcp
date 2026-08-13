@@ -219,11 +219,9 @@ class PropertyCopyItemStub:
         self.fusion_cache = "Auto"
         self.voice_state = {"isEnabled": True, "amount": 33}
         self.copy_grades_targets = []
-        self.keyframes = {
-            "Pan": [(0, 0.1), (12, 0.4)],
-            "Speed": [(0, 100), (20, 75)],
-        }
-        self.added_keyframes = []
+        # No keyframe methods on this stub, deliberately: TimelineItem has none
+        # in any Resolve build, and a fake carrying methods reality lacks is
+        # exactly how the phantom keyframe-copy path survived here for so long.
 
     def GetUniqueId(self):
         return self.unique_id
@@ -314,18 +312,6 @@ class PropertyCopyItemStub:
         self.copy_grades_targets = targets
         return True
 
-    def GetKeyframeCount(self, prop):
-        return len(self.keyframes.get(prop, []))
-
-    def GetKeyframeAtIndex(self, prop, index):
-        return {"frame": self.keyframes[prop][index][0]}
-
-    def GetPropertyAtKeyframeIndex(self, prop, index):
-        return self.keyframes[prop][index][1]
-
-    def AddKeyframe(self, prop, frame, value):
-        self.added_keyframes.append((prop, frame, value))
-        return True
 
 
 class AppendClipInfosResultHandlingTest(unittest.TestCase):
@@ -623,20 +609,24 @@ class AppendClipInfosResultHandlingTest(unittest.TestCase):
         self.assertEqual(duplicate.fusion_cache, "Auto")
         self.assertEqual(duplicate.voice_state, {"isEnabled": True, "amount": 33})
         self.assertEqual(source.copy_grades_targets, [duplicate])
-        self.assertIn(("Pan", 0, 0.1), duplicate.added_keyframes)
-        self.assertIn(("Speed", 20, 75), duplicate.added_keyframes)
+        # The keyframes group reports the API gap, never a copy.
+        self.assertEqual(result["keyframes"]["copied"], 0)
+        self.assertTrue(result["keyframes"]["unavailable"])
         self.assertFalse(result["transitions"]["copied"])
 
-    def test_copy_keyframes_copies_requested_properties(self):
+    def test_copy_keyframes_reports_the_api_gap_not_a_copy(self):
         source = PropertyCopyItemStub()
         duplicate = PropertyCopyItemStub()
-        duplicate.added_keyframes = []
 
         result = _copy_keyframes(source, duplicate, ["Pan"])
 
+        # success=True with copied=0: the group is informational, and failing the
+        # whole duplicate over a permanent API absence would be the wrong signal.
         self.assertTrue(result["success"])
-        self.assertEqual(result["copied"], 2)
-        self.assertEqual(duplicate.added_keyframes, [("Pan", 0, 0.1), ("Pan", 12, 0.4)])
+        self.assertEqual(result["copied"], 0)
+        self.assertEqual(len(result["unavailable"]), 1)
+        self.assertEqual(result["unavailable"][0]["property"], "Pan")
+        self.assertIn("no TimelineItem keyframe methods", result["unavailable"][0]["error"])
 
     def test_edit_kernel_capabilities_reports_boundaries(self):
         caps = _timeline_edit_kernel_capabilities()
@@ -658,7 +648,8 @@ class AppendClipInfosResultHandlingTest(unittest.TestCase):
         self.assertEqual(probe["all_properties"]["Pan"], 0.25)
         self.assertEqual(probe["known_properties"]["DynamicZoomEnable"]["value"], True)
         self.assertEqual(probe["known_properties"]["StabilizationStrength"]["value"], 0.75)
-        self.assertEqual(probe["keyframes"]["Pan"]["count"], 2)
+        self.assertFalse(probe["keyframes"]["Pan"]["available"])
+        self.assertIn("no TimelineItem keyframe methods", probe["keyframes"]["Pan"]["error"])
 
     def test_collect_timeline_items_in_range_returns_partial_overlaps(self):
         video = TimelineItemDupStub(unique_id="video-range", start=100, end=160)

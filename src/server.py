@@ -3990,35 +3990,29 @@ def _copy_takes(source_item, duplicate_item):
     return {"success": not failed, "copied": copied, "failed": failed}
 
 
+#: TimelineItem has NO keyframe methods in any Resolve edition or build:
+#: AddKeyframe / GetKeyframeCount / GetKeyframeAtIndex / DeleteKeyframe and
+#: friends do not exist — Resolve's only keyframe API is
+#: Resolve.Get/SetKeyframeMode, a UI-mode switch. Animate via the clip's
+#: Fusion comp instead. See docs/reference/api-limitations.md.
+_TIMELINE_KEYFRAME_GAP = (
+    "Resolve's scripting API has no TimelineItem keyframe methods (any "
+    "edition/build); keyframe the clip's Fusion comp instead — "
+    "fusion_comp(action='add_keyframe')"
+)
+
+
 def _copy_keyframes(source_item, duplicate_item, properties: Optional[List[str]] = None):
+    # Previously probed the phantom methods per property; every probe raised and
+    # landed in `unavailable`, so reporting the gap directly is the same result
+    # without laundering a permanent API absence into per-build error noise.
     properties = properties or list(_DUPLICATE_KEYFRAME_PROPERTIES)
-    copied = 0
-    failed = []
-    unavailable = []
-    for prop in properties:
-        try:
-            count = int(source_item.GetKeyframeCount(prop) or 0)
-        except Exception as exc:
-            unavailable.append({"property": prop, "error": f"GetKeyframeCount failed: {exc}"})
-            continue
-        for index in range(count):
-            try:
-                keyframe = source_item.GetKeyframeAtIndex(prop, index)
-                frame = keyframe.get("frame") if isinstance(keyframe, dict) else keyframe
-                value = source_item.GetPropertyAtKeyframeIndex(prop, index)
-            except Exception as exc:
-                failed.append({"property": prop, "index": index, "error": f"read keyframe failed: {exc}"})
-                continue
-            try:
-                added = bool(duplicate_item.AddKeyframe(prop, frame, value))
-            except Exception as exc:
-                failed.append({"property": prop, "frame": frame, "error": f"AddKeyframe failed: {exc}"})
-                continue
-            if added:
-                copied += 1
-            else:
-                failed.append({"property": prop, "frame": frame, "error": "AddKeyframe returned false"})
-    return {"success": not failed, "copied": copied, "failed": failed, "unavailable": unavailable}
+    return {
+        "success": True,
+        "copied": 0,
+        "failed": [],
+        "unavailable": [{"property": prop, "error": _TIMELINE_KEYFRAME_GAP} for prop in properties],
+    }
 
 
 def _copy_duplicate_item_state(source_item, duplicate_item, groups: List[str]):
@@ -4878,23 +4872,9 @@ def _safe_get_property(item, key: Optional[str] = None):
 
 
 def _probe_keyframes(item, properties: List[str]):
-    out = {}
-    for prop in properties:
-        try:
-            count = int(item.GetKeyframeCount(prop) or 0)
-        except Exception as exc:
-            out[prop] = {"available": False, "error": str(exc)}
-            continue
-        frames = []
-        for index in range(count):
-            try:
-                keyframe = item.GetKeyframeAtIndex(prop, index)
-                value = item.GetPropertyAtKeyframeIndex(prop, index)
-                frames.append({"keyframe": _ser(keyframe), "value": _ser(value)})
-            except Exception as exc:
-                frames.append({"error": str(exc)})
-        out[prop] = {"available": True, "count": count, "frames": frames}
-    return out
+    # No phantom probing: the methods this used to call do not exist in any
+    # build, so the honest per-property answer is the documented gap itself.
+    return {prop: {"available": False, "error": _TIMELINE_KEYFRAME_GAP} for prop in properties}
 
 
 def _timeline_item_probe(item):
@@ -22605,11 +22585,10 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
       set_composite(Opacity?, CompositeMode?, ...) -> {success}
       get_audio(...) -> {Volume, Pan, AudioSyncOffset, ...}
       set_audio(Volume?, Pan?, ...) -> {success}
-      get_keyframes(property, ...) -> {property, count, keyframes}
-      add_keyframe(property, frame, value, ...) -> {success}
-      modify_keyframe(property, frame, new_value?, new_frame?, ...) -> {success}
-      delete_keyframe(property, frame, ...) -> {success}
-      set_keyframe_interpolation(property, frame, interpolation, ...) -> {success}  — Linear, Bezier, EaseIn, EaseOut, EaseInOut
+      get_keyframes / add_keyframe / modify_keyframe / delete_keyframe /
+      set_keyframe_interpolation -> {error}  — Resolve's API has NO TimelineItem
+      keyframe methods (any edition/build); these explain the gap and point to
+      the working route: fusion_comp(action="add_keyframe") on the clip's comp
 
     Default: track_type="video", track_index=1, item_index=0
     """
@@ -22764,34 +22743,25 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
                 results[k] = bool(item.SetProperty(k, v))
         return _ok(**results) if results else _err(f"Specify one or more of: {', '.join(sorted(valid))}")
 
-    # ── Keyframes ──
-    elif action == "get_keyframes":
-        prop = p["property"]
-        count = item.GetKeyframeCount(prop)
-        if count == 0:
-            return {"property": prop, "count": 0, "keyframes": []}
-        kfs = []
-        for i in range(count):
-            kf = item.GetKeyframeAtIndex(prop, i)
-            val = item.GetPropertyAtKeyframeIndex(prop, i)
-            kfs.append({"frame": kf.get("frame") if isinstance(kf, dict) else kf, "value": val})
-        return {"property": prop, "count": count, "keyframes": kfs}
-    elif action == "add_keyframe":
-        return {"success": bool(item.AddKeyframe(p["property"], p["frame"], p["value"]))}
-    elif action == "modify_keyframe":
-        kw = {}
-        if "new_value" in p:
-            kw["value"] = p["new_value"]
-        if "new_frame" in p:
-            kw["frame"] = p["new_frame"]
-        return {"success": bool(item.ModifyKeyframe(p["property"], p["frame"], **kw))}
-    elif action == "delete_keyframe":
-        return {"success": bool(item.DeleteKeyframe(p["property"], p["frame"]))}
-    elif action == "set_keyframe_interpolation":
-        valid = ["Linear", "Bezier", "EaseIn", "EaseOut", "EaseInOut"]
-        if p.get("interpolation") not in valid:
-            return _err(f"Invalid interpolation. Must be one of: {', '.join(valid)}")
-        return {"success": bool(item.SetKeyframeInterpolation(p["property"], p["frame"], p["interpolation"]))}
+    # ── Keyframes — a documented API gap, not a build problem ──
+    elif action in ("get_keyframes", "add_keyframe", "modify_keyframe",
+                    "delete_keyframe", "set_keyframe_interpolation"):
+        # These actions used to call TimelineItem.AddKeyframe / ModifyKeyframe /
+        # DeleteKeyframe / GetKeyframeCount — methods that do not exist in any
+        # Resolve edition or build (the only keyframe API Resolve exposes is
+        # Resolve.Get/SetKeyframeMode, which switches the Edit-page UI mode).
+        # They failed everywhere, and over the bridge the failure surfaced as a
+        # misleading per-build capability error. Refuse honestly instead.
+        return _err(
+            "Resolve's scripting API has no TimelineItem keyframe methods — "
+            f"'{action}' can never succeed, on any edition or build. To animate "
+            "transform/opacity/crop from a script, keyframe the clip's Fusion "
+            "comp instead: add a Transform tool and use "
+            "fusion_comp(action='add_keyframe', params={tool_name, input_name, "
+            "time, value}). Static (un-animated) values remain settable via "
+            "set_transform/set_crop/set_composite. "
+            "See docs/reference/api-limitations.md (TimelineItem keyframes)."
+        )
 
     return _unknown(action, ["get_name","get_property","set_property","get_duration","get_start","get_end","get_source_start_frame","get_source_end_frame","get_source_start_time","get_source_end_time","get_left_offset","get_right_offset","set_clip_enabled","get_clip_enabled","update_sidecar","get_unique_id","get_media_pool_item","get_stereo_convergence","get_stereo_left_window","get_stereo_right_window","get_linked_items","get_track_type_and_index","get_source_audio_mapping","load_burnin_preset","set_name","get_voice_isolation_state","set_voice_isolation_state","get_retime","set_retime","get_transform","set_transform","get_crop","set_crop","get_composite","set_composite","get_audio","set_audio","get_keyframes","add_keyframe","modify_keyframe","delete_keyframe","set_keyframe_interpolation"])
 
@@ -26041,7 +26011,9 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         keyframes = []
         kfs = inp.GetKeyFrames()
         if kfs:
-            for idx in sorted(kfs):
+            # Numeric sort even when the bridge's JSON round-trip has turned the
+            # 1-based integer indices into strings ("10" must not sort before "2").
+            for idx in sorted(kfs, key=float):
                 frame = kfs[idx]
                 value = tool.GetInput(p["input_name"], frame)
                 keyframes.append({"time": frame, "value": _ser(value)})

@@ -93,6 +93,18 @@ in success and in error responses.
 
 - Tool availability varies by Resolve/Fusion build. The kernel reports common
   tool IDs but does not pretend every Fusion tool is installed everywhere.
+- **Over the in-app bridge** (free edition, or external scripting disabled) the
+  full Fusion object model works, including keyframing: the bridge carries
+  subscripting (`tool["Input"]`, `input[time] = value`) as first-class
+  `get_item`/`set_item` operations, and its strict method gate is relaxed for
+  Fusion-provenance objects because `dir()` under-reports Fusion methods
+  (`SetAttrs`, `AddModifier`, `GetKeyFrames` are real yet unlisted). A bridge
+  runtime installed before these operations existed refuses with a message
+  naming the fix (re-run `install.py`, then reload the bridge).
+- Keyframing is the **Fusion route only**: Resolve's API has no TimelineItem
+  keyframe methods on any edition or build, so Edit-page transform keyframes
+  cannot be scripted directly — animate in the clip's comp instead
+  (`fusion_comp` `add_keyframe`). See `docs/reference/api-limitations.md`.
 - Fusion inputs are heterogeneous. Some are readable after writes, some coerce
   values, and some can be effectively write-only depending on the tool.
 - Active Fusion page comps and timeline item comps are different scopes. The

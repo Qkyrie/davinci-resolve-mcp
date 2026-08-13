@@ -161,7 +161,12 @@ class ResolveOperations:
         "set_current_timeline",
     )
     #: The transparent proxy. See the module docstring for its security model.
-    PROXY_OPERATIONS = ("call", "release_handles", "list_methods", "get_attribute")
+    #: `get_item`/`set_item` are part of it: Fusion's object model runs on
+    #: subscripting (`tool["StyledText"]`, `input[frame] = value`), which no
+    #: method call can express. Their security model is `call`'s — targets are
+    #: bridge-minted handles, private names are refused, the token is the gate.
+    PROXY_OPERATIONS = ("call", "release_handles", "list_methods", "get_attribute",
+                        "get_item", "set_item")
     #: Lifecycle: they act on the bridge, never on the project. Separated from the
     #: write surface so "writes stay narrower than reads" keeps measuring what it
     #: was written to measure.
@@ -691,6 +696,77 @@ class ResolveOperations:
                     "note": "present-but-None; on Resolve objects this is indistinguishable "
                             "from absent, because getattr never raises"}
         return {"kind": "value", "value": self._encode(value, shape=f"{self._shape_of(arguments.get('target', 'resolve'))}.{name}")}
+
+    @staticmethod
+    def _subscript_key(arguments: Dict[str, Any]) -> Any:
+        """Validate a subscript key: a string input name or a numeric time.
+
+        Underscore-prefixed strings are refused for the same reason `call`
+        refuses them — they are the traversal surface, and no Fusion input or
+        attribute table key legitimately starts with one.
+        """
+        key = arguments.get("key")
+        if isinstance(key, bool) or not isinstance(key, (str, int, float)):
+            raise OperationError("invalid_arguments", "key must be a string or a number")
+        if isinstance(key, str) and key.startswith("_"):
+            raise OperationError("method_not_allowed", "private and dunder attributes are not reachable")
+        return key
+
+    def op_get_item(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Subscript read — `target[key]`, the access Fusion's object model runs on.
+
+        A tool's inputs are reached by subscripting the tool
+        (`tool["StyledText"]`) and an animated value by subscripting the input
+        with a time (`input[12]`). Neither has a method-call equivalent that
+        preserves the object: `GetInput` flattens an Input to its current value,
+        and keyframe *writes* (`input[time] = value`) have no method form at
+        all. Without this pair the entire fusion_comp keyframe surface fails
+        over the bridge — and fails misleadingly, as a capability error on a
+        capability Resolve actually has.
+
+        A missing key returns None rather than raising: that is Fusion's own
+        (Lua-table) semantics for `tool["NoSuchInput"]`, and the server's call
+        sites test `if not inp` against exactly that contract.
+        """
+        target_key = arguments.get("target", "resolve")
+        target = self._resolve_target(target_key)
+        key = self._subscript_key(arguments)
+        try:
+            value = target[key]
+        except TypeError as exc:
+            raise OperationError(
+                "capability_unavailable",
+                f"{type(target).__name__} does not support subscripting: {str(exc)[:200]}",
+            )
+        except (KeyError, IndexError):
+            return {"value": None}
+        except Exception as exc:  # noqa: BLE001 - a raising getitem is an answer
+            raise OperationError("resolve_raised", f"reading [{key!r}] raised: {str(exc)[:200]}")
+        return {"value": self._encode(value, shape=f"{self._shape_of(target_key)}[]")}
+
+    def op_set_item(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Subscript write — `target[key] = value`; a keyframe write when key is a time.
+
+        Classified under the proxy surface, not WRITE_OPERATIONS: a caller
+        holding the token already writes freely through `call` (SetProperty,
+        SetInput, ...), so gating this differently would guard nothing. The
+        value decodes like any `call` argument — handles rehydrate to the live
+        objects this bridge minted them from.
+        """
+        target_key = arguments.get("target", "resolve")
+        target = self._resolve_target(target_key)
+        key = self._subscript_key(arguments)
+        value = self._decode(arguments.get("value"))
+        try:
+            target[key] = value
+        except TypeError as exc:
+            raise OperationError(
+                "capability_unavailable",
+                f"{type(target).__name__} does not support subscript assignment: {str(exc)[:200]}",
+            )
+        except Exception as exc:  # noqa: BLE001 - a raising setitem is an answer
+            raise OperationError("resolve_raised", f"writing [{key!r}] raised: {str(exc)[:200]}")
+        return {"ok": True}
 
     def op_release_handles(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Drop handles a client no longer needs, or all of them."""

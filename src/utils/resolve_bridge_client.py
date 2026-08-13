@@ -313,11 +313,65 @@ class BridgeProxy:
                 # is None, and a capability check refuses instead of guessing.
                 # A `callable` answer lands here too — Resolve fabricates one for
                 # any name, so it is not evidence the attribute exists.
+                if self._fusion_provenance():
+                    # …except on Fusion objects, where `dir()` under-reports:
+                    # SetAttrs, AddModifier, GetKeyFrames and friends are real,
+                    # working methods that dir() does not list (the live failure
+                    # that motivated this — a working keyframe surface refused
+                    # as "not in this Resolve build"). Absence from dir() is not
+                    # evidence there, so match native Fusion semantics instead:
+                    # hand back a method and let a wrong name fail at call time.
+                    return _BoundMethod(self._transport, self._handle, name)
                 raise AttributeError(
                     f"{self._shape or self._type_name or 'Resolve object'} has no attribute "
                     f"{name!r} in this Resolve build"
                 )
         return _BoundMethod(self._transport, self._handle, name)
+
+    #: Shape segments that put an object inside the Fusion graph. Everything
+    #: minted downstream of one of these accessors keeps the segment in its
+    #: provenance string, so one membership test covers comps, tools, inputs
+    #: and subscript-derived children alike. Deliberately NOT a substring match:
+    #: `InsertFusionTitleIntoTimeline` returns a TimelineItem, and relaxing the
+    #: gate there would break the ~50 `getattr(obj, name, None)` capability
+    #: checks this proxy exists to answer truthfully.
+    _FUSION_SEGMENTS = frozenset({
+        "Fusion", "GetFusionCompByIndex", "GetFusionCompByName",
+        "AddFusionComp", "GetCurrentComp",
+    })
+
+    def _fusion_provenance(self) -> bool:
+        shape = self._shape or ""
+        return any(seg.rstrip("[]") in self._FUSION_SEGMENTS for seg in shape.split("."))
+
+    # -- subscripting, the access Fusion's object model runs on ------------
+
+    def __getitem__(self, key: Any) -> Any:
+        """`tool["StyledText"]` / `input[frame]` — a bridge `get_item`."""
+        result = self._subscript("get_item", {"target": self._handle, "key": key})
+        return _decode_value(self._transport, (result or {}).get("value"))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        """`input[frame] = value` — the keyframe write, as a bridge `set_item`."""
+        self._subscript("set_item", {"target": self._handle, "key": key,
+                                     "value": _encode_argument(value)})
+
+    def _subscript(self, operation: str, arguments: Dict[str, Any]) -> Any:
+        try:
+            return self._transport.request(operation, arguments)
+        except BridgeCallError as exc:
+            if exc.code == "operation_not_allowed":
+                # The in-Resolve runtime is a copy taken at install time, so it
+                # can predate this operation. Say what fixes it rather than
+                # letting "operation not exposed" read as a Resolve limitation.
+                raise BridgeCallError(
+                    exc.code,
+                    f"this bridge runtime predates {operation!r} — re-run install.py, "
+                    "then Workspace > Scripts > resolve_bridge (or the bridge `reload` "
+                    "operation) to pick up the new runtime",
+                    exc.details,
+                ) from exc
+            raise
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<BridgeProxy {self._handle}>"
