@@ -10,6 +10,11 @@ Thin router; depth stays in the kernel.
 - **Live tool mechanics** — `docs/kernels/fusion-composition-kernel.md` (the
   `fusion_comp` boundary).
 - **Offline authoring** — `resolve-advanced/README.md` → the `fusion` tool.
+- **ML person mask / matte (free Magic Mask alternative)** —
+  `docs/guides/person-mask-matte-guide.md` + `scripts/person_matte/`. Covers
+  frame-accurate export (grab_frames and ffmpeg are both unreliable for this),
+  the `MaskChannel` gotcha when wiring an image `Loader` into an `EffectMask`,
+  and a `duplicate_clips`/`copy_clips` duration bug on VFR-ish sources.
 
 ## Two servers — author offline, apply live
 

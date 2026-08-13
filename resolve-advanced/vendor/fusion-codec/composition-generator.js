@@ -53,13 +53,30 @@ function serializeValue(value, indent = 0) {
 }
 
 /**
+ * True for plain "ToolName.OutputName" connection-reference strings —
+ * false for literal string values that merely contain a dot (file paths,
+ * decimals-as-strings, version numbers, ...). Deliberately conservative:
+ * requires the *whole* string to be a bare identifier.identifier pair with
+ * no path separators, so e.g. "/some/dir/frame_0000.png" (a real Loader
+ * Clip value) is never mistaken for a connection reference.
+ */
+function isConnectionRef(value) {
+  return (
+    typeof value === 'string'
+    && !value.includes('/')
+    && !value.includes('\\')
+    && /^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$/.test(value)
+  );
+}
+
+/**
  * Serialize a single input value with optional Input wrapper
  */
 function serializeInput(name, value, indent) {
   const pad = '\t'.repeat(indent);
 
   // Connection reference: "ToolName.Output" → special syntax
-  if (typeof value === 'string' && value.includes('.') && !value.startsWith('"')) {
+  if (isConnectionRef(value)) {
     return `${pad}${name} = Input { SourceOp = "${value.split('.')[0]}", Source = "${value.split('.')[1]}" },`;
   }
 
@@ -273,7 +290,7 @@ function specToApiCalls(spec) {
     if (node.inputs) {
       for (const [inputName, value] of Object.entries(node.inputs)) {
         // Skip connection-like values — those go through connect
-        if (typeof value === 'string' && value.includes('.')) continue;
+        if (isConnectionRef(value)) continue;
         calls.push({
           action: 'set_input',
           params: { tool_name: name, input_name: inputName, value },
@@ -370,6 +387,7 @@ function listTemplates() {
     'picture-in-picture',
     'film-grain',
     'color-correct',
+    'reels-occlusion',
   ];
 
   const templates = [];
